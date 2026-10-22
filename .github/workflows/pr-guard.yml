@@ -22,6 +22,10 @@ on:
         description: "Branch prefixes that are always treated as bug fixes (RCA required)"
         type: string
         default: "fix,hotfix"
+      rca_field:
+        description: "Jira custom field id that stores the RCA"
+        type: string
+        default: "customfield_10359"
       exempt_branch_prefixes:
         type: string
         default: "dependabot/,renovate/,release/"
@@ -50,6 +54,7 @@ jobs:
           BRANCH_TYPES: ${{ inputs.branch_types }}
           BUG_BRANCH_TYPES: ${{ inputs.bug_branch_types }}
           EXEMPT_PREFIXES: ${{ inputs.exempt_branch_prefixes }}
+          RCA_FIELD: ${{ inputs.rca_field }}
         with:
           script: |
             const env = process.env;
@@ -144,7 +149,7 @@ jobs:
             if (!jiraReady) {
               errors.push('Jira secrets missing (JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN). Ask the repo admin to add them.');
             } else if (jiraKey) {
-              const r = await jira('GET', `/rest/api/2/issue/${jiraKey}?fields=status,issuetype,summary`);
+              const r = await jira('GET', `/rest/api/2/issue/${jiraKey}?fields=status,issuetype,summary,${env.RCA_FIELD}`);
               if (r.status === 404) errors.push(`Jira ticket **${jiraKey}** not found (or the automation user can't see it).`);
               else if (r.status === 401 || r.status === 403) errors.push(`Jira auth failed (${r.status}). Check JIRA_EMAIL / JIRA_API_TOKEN.`);
               else if (!r.ok) core.warning(`Jira lookup failed (${r.status}): ${r.text.slice(0, 300)}`);
@@ -175,7 +180,7 @@ jobs:
               } else {
                 const missing = Object.entries({ Problem: rca.problem, 'Root cause': rca.rootCause, Impact: rca.impact, Prevention: rca.prevention })
                   .filter(([, v]) => !v).map(([k]) => `**${k}**`);
-                if (missing.length) rcaErrors.push(`${why}: Root Cause Analysis incomplete. Fill in ${missing.join(', ')}. It's sent to Jira once complete.`);
+                if (missing.length) rcaErrors.push(`${why}: Root Cause Analysis incomplete. Fill in ${missing.join(', ')}. It's saved to the Jira RCA field once complete.`);
               }
             }
             const rcaComplete = isBug && rcaErrors.length === 0;
@@ -202,7 +207,7 @@ jobs:
             if (rcaErrors.length) {
               await upsertPrComment(`${MARK}\n### ❌ PR Guard: RCA required before merge\nLinked to **${jiraKey}** (status still moves to ${env.REVIEW_STATUS}).\n\n${rcaErrors.map(e => `- ${e}`).join('\n')}${warnBlock}${footer}`);
             } else if (warnings.length || sticky) {
-              await upsertPrComment(`${MARK}\n### ${warnings.length ? '⚠️' : '✅'} PR Guard passed\nLinked to **${jiraKey}**${rcaComplete ? ' · RCA synced to Jira' : ''}.${warnBlock}`);
+              await upsertPrComment(`${MARK}\n### ${warnings.length ? '⚠️' : '✅'} PR Guard passed\nLinked to **${jiraKey}**${rcaComplete ? ' · RCA saved to Jira field' : ''}.${warnBlock}`);
             }
 
             // ---------- 6. Jira sync (only for open PRs) ----------
@@ -210,28 +215,30 @@ jobs:
             if (pr.state === 'open' && issue && jiraEvents.includes(action)) {
               const browse = `${base}/browse/${jiraKey}`;
 
-              // 6a. RCA comment: only when complete. Created once, updated on later edits.
+              // 6a. RCA → Jira custom field (only when complete). Overwritten on later edits.
               if (rcaComplete) {
-                const tag = `pr-guard:${owner}/${repo}#${pr.number}`;
+                const fieldId = env.RCA_FIELD;
                 const safeTitle = pr.title.replace(/[|\[\]]/g, ' ');
-                const jbody = [
-                  'h3. 🐛 Root Cause Analysis',
-                  `*Pull request:* [${safeTitle}|${pr.html_url}]  (by ${pr.user.login})`,
-                  '', '*Problem:*', rca.problem,
-                  '', '*Root cause:*', rca.rootCause,
-                  '', '*Impact:*', rca.impact,
-                  '', '*Prevention:*', rca.prevention,
-                  '', '----',
-                  `{color:#97a0af}${tag}: auto-synced from the PR description{color}`,
+                const value = [
+                  `*Problem:* ${rca.problem}`,
+                  '',
+                  `*Root cause:* ${rca.rootCause}`,
+                  '',
+                  `*Impact:* ${rca.impact}`,
+                  '',
+                  `*Prevention:* ${rca.prevention}`,
+                  '',
+                  `_Source: [${safeTitle}|${pr.html_url}] by ${pr.user.login}_`,
                 ].join('\n');
-                const existing = await jira('GET', `/rest/api/2/issue/${jiraKey}/comment?maxResults=100&orderBy=-created`);
-                const prev = existing.ok ? (existing.json.comments || []).find(c => (c.body || '').includes(tag)) : null;
-                let r;
-                if (prev && prev.body === jbody) { core.info('RCA comment unchanged.'); r = { ok: true }; }
-                else if (prev) r = await jira('PUT', `/rest/api/2/issue/${jiraKey}/comment/${prev.id}`, { body: jbody });
-                else r = await jira('POST', `/rest/api/2/issue/${jiraKey}/comment`, { body: jbody });
-                if (!r.ok) core.warning(`Could not write RCA comment (${r.status}): ${r.text?.slice(0, 300)}`);
-                else core.info(`RCA ${prev ? 'updated' : 'posted'} on ${browse}`);
+                const current = issue.fields?.[fieldId];
+                if (typeof current === 'string' && current.trim() === value.trim()) {
+                  core.info(`RCA field unchanged on ${jiraKey}.`);
+                } else {
+                  const r = await jira('PUT', `/rest/api/2/issue/${jiraKey}`, { fields: { [fieldId]: value } });
+                  if (r.ok) core.info(`RCA written to field ${fieldId} on ${browse}`);
+                  else core.warning(`Could not write RCA field ${fieldId} (${r.status}): ${r.text?.slice(0, 400)}. ` +
+                    `Check the field is on the Edit screen for this issue type and the automation user can edit issues.`);
+                }
               }
 
               // 6b. Transition to "In Review" (not for drafts). Happens even if RCA is incomplete.
