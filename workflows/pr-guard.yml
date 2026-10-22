@@ -1,0 +1,237 @@
+# Reusable workflow: validates branch name + PR description, posts RCA to Jira, moves ticket to "In Review".
+# Lives in: <you>/pr-automation/.github/workflows/pr-guard.yml
+# Called by a small stub in every repo (see caller-stub/pr-guard.yml).
+
+name: PR Guard (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      jira_projects:
+        description: "Comma-separated allowed Jira project keys, e.g. LYRIC,CORE (empty = any)"
+        type: string
+        default: ""
+      review_status:
+        description: "Jira status/transition name to move the ticket to"
+        type: string
+        default: "In Review"
+      branch_types:
+        type: string
+        default: "feat,fix,hotfix,refactor,perf,docs,chore"
+      bug_branch_types:
+        description: "Branch prefixes that are always treated as bug fixes (RCA required)"
+        type: string
+        default: "fix,hotfix"
+      exempt_branch_prefixes:
+        type: string
+        default: "dependabot/,renovate/,release/"
+    secrets:
+      JIRA_BASE_URL:
+        required: false
+      JIRA_EMAIL:
+        required: false
+      JIRA_API_TOKEN:
+        required: false
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository   # skip fork PRs (no secrets)
+    steps:
+      - name: Validate PR and sync Jira
+        uses: actions/github-script@v7
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECTS: ${{ inputs.jira_projects }}
+          REVIEW_STATUS: ${{ inputs.review_status }}
+          BRANCH_TYPES: ${{ inputs.branch_types }}
+          BUG_BRANCH_TYPES: ${{ inputs.bug_branch_types }}
+          EXEMPT_PREFIXES: ${{ inputs.exempt_branch_prefixes }}
+        with:
+          script: |
+            const env = process.env;
+            const pr = context.payload.pull_request;
+            const action = context.payload.action;
+            const { owner, repo } = context.repo;
+            const branch = pr.head.ref;
+            const list = s => (s || '').split(',').map(x => x.trim()).filter(Boolean);
+            const errors = [];
+
+            // ---------- 0. Exemptions ----------
+            if (pr.user.type === 'Bot' || list(env.EXEMPT_PREFIXES).some(p => branch.startsWith(p))) {
+              core.info(`Skipping: exempt branch or bot author (${branch})`);
+              return;
+            }
+
+            // ---------- 1. Branch name ----------
+            const types = list(env.BRANCH_TYPES);
+            const branchRe = new RegExp(`^(${types.join('|')})\\/([A-Z][A-Z0-9]+-\\d+)-[a-z0-9]+(?:-[a-z0-9]+)*$`);
+            const bm = branch.match(branchRe);
+            let branchType = null, jiraKey = null;
+            if (!bm) {
+              errors.push(`Branch \`${branch}\` doesn't match \`<type>/<JIRA-ID>-<short-name>\`. ` +
+                `Allowed types: ${types.map(t => '`' + t + '`').join(', ')}. Example: \`fix/LYRIC-539-testing-task\`. ` +
+                `Rename with: \`git branch -m <new-name> && git push origin -u <new-name>\` (then open a new PR).`);
+            } else {
+              branchType = bm[1];
+              jiraKey = bm[2];
+              const projects = list(env.JIRA_PROJECTS);
+              if (projects.length && !projects.includes(jiraKey.split('-')[0])) {
+                errors.push(`Jira project \`${jiraKey.split('-')[0]}\` is not allowed here. Allowed: ${projects.join(', ')}.`);
+              }
+            }
+
+            // ---------- 2. Parse PR description ----------
+            const clean = (pr.body || '').replace(/<!--[\s\S]*?-->/g, '').replace(/\r\n/g, '\n');
+            const sections = {};
+            for (const part of clean.split(/^##\s+/m).slice(1)) {
+              const nl = part.indexOf('\n');
+              const title = (nl === -1 ? part : part.slice(0, nl));
+              const key = title.replace(/[^a-zA-Z& ]/g, '').trim().toLowerCase();
+              sections[key] = nl === -1 ? '' : part.slice(nl + 1);
+            }
+            // Text that's left after removing empty template scaffolding
+            const meaningful = t => (t || '').split('\n').map(l => l.trim()).filter(l =>
+              l &&
+              !/^[-*]$/.test(l) &&                // empty bullet
+              !/^\d+\.$/.test(l) &&               // empty numbered step
+              !/^-{3,}$/.test(l) &&               // horizontal rule
+              !/^\*\*[^*]+:\*\*$/.test(l) &&      // label with no value, e.g. **Expected result:**
+              !/^[-*]\s*\[[ xX]\]/.test(l)        // checkbox lines
+            ).join('\n').trim();
+            const field = (text, label) => {
+              const r = new RegExp(`\\*\\*${label}:\\*\\*([\\s\\S]*?)(?=\\n\\s*\\*\\*[^*\\n]+:\\*\\*|$)`, 'i');
+              const m = (text || '').match(r);
+              return m ? meaningful(m[1]) : '';
+            };
+
+            if (!pr.body || !pr.body.trim()) {
+              errors.push('PR description is empty. Please use the PR template.');
+            } else {
+              for (const s of ['summary', 'what changed', 'how to test']) {
+                if (!(s in sections)) errors.push(`Section **## ${s.replace(/\b\w/g, c => c.toUpperCase())}** is missing.`);
+                else if (!meaningful(sections[s])) errors.push(`Section **${s.replace(/\b\w/g, c => c.toUpperCase())}** is empty.`);
+              }
+              if (!('type of change' in sections)) errors.push('Section **## Type of change** is missing.');
+              else if (!/-\s*\[[xX]\]/.test(sections['type of change'])) errors.push('Tick at least one box under **Type of change**.');
+              if (!('impact & risk' in sections)) errors.push('Section **## Impact & Risk** is missing.');
+              else if (!/\*\*Risk level:\*\*\s*(Low|Medium|High)\b/i.test(sections['impact & risk'])) errors.push('Set **Risk level:** to Low, Medium or High.');
+            }
+
+            // ---------- 3. Jira lookup ----------
+            const base = (env.JIRA_BASE_URL || '').replace(/\/+$/, '');
+            const auth = 'Basic ' + Buffer.from(`${env.JIRA_EMAIL}:${env.JIRA_API_TOKEN}`).toString('base64');
+            async function jira(method, path, data) {
+              const res = await fetch(base + path, {
+                method,
+                headers: { Authorization: auth, Accept: 'application/json', 'Content-Type': 'application/json' },
+                body: data ? JSON.stringify(data) : undefined,
+              });
+              const text = await res.text();
+              let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
+              return { ok: res.ok, status: res.status, json, text };
+            }
+
+            let issue = null;
+            const jiraReady = base && env.JIRA_EMAIL && env.JIRA_API_TOKEN;
+            if (!jiraReady) {
+              errors.push('Jira secrets missing (JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN). Ask the repo admin to add them.');
+            } else if (jiraKey) {
+              const r = await jira('GET', `/rest/api/2/issue/${jiraKey}?fields=status,issuetype,summary`);
+              if (r.status === 404) errors.push(`Jira ticket **${jiraKey}** not found (or the automation user can't see it).`);
+              else if (r.status === 401 || r.status === 403) errors.push(`Jira auth failed (${r.status}). Check JIRA_EMAIL / JIRA_API_TOKEN.`);
+              else if (!r.ok) core.warning(`Jira lookup failed (${r.status}): ${r.text.slice(0, 300)}`);
+              else issue = r.json;
+            }
+
+            // ---------- 4. Bug detection + RCA ----------
+            const bugTicked = /-\s*\[[xX]\][^\n]*bug fix/i.test(sections['type of change'] || '');
+            const bugBranch = list(env.BUG_BRANCH_TYPES).includes(branchType);
+            const bugIssue = /bug/i.test(issue?.fields?.issuetype?.name || '');
+            const isBug = bugTicked || bugBranch || bugIssue;
+            let rca = null;
+            if (isBug && (pr.body || "").trim()) {
+              const rcaText = sections['root cause analysis'];
+              if (rcaText === undefined) {
+                errors.push('This is a bug fix: the **🐛 Root Cause Analysis** section is required.');
+              } else {
+                rca = {
+                  problem: field(rcaText, 'Problem'),
+                  rootCause: field(rcaText, 'Root cause'),
+                  impact: field(rcaText, 'Impact'),
+                  prevention: field(rcaText, 'Prevention'),
+                };
+                const missing = Object.entries({ Problem: rca.problem, 'Root cause': rca.rootCause, Impact: rca.impact, Prevention: rca.prevention })
+                  .filter(([, v]) => !v).map(([k]) => `**${k}**`);
+                if (missing.length) errors.push(`Root Cause Analysis incomplete. Fill in: ${missing.join(', ')}.`);
+              }
+              if (!bugTicked) errors.push('This looks like a bug fix (branch prefix or Jira type). Tick **🐛 Bug fix** under Type of change.');
+            }
+
+            // ---------- 5. Sticky PR comment ----------
+            const MARK = '<!-- pr-guard -->';
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pr.number, per_page: 100 });
+            const sticky = comments.find(c => c.body && c.body.includes(MARK));
+            async function upsertPrComment(body) {
+              if (sticky) { if (sticky.body !== body) await github.rest.issues.updateComment({ owner, repo, comment_id: sticky.id, body }); }
+              else await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
+            }
+
+            if (errors.length) {
+              await upsertPrComment(`${MARK}\n### ❌ PR Guard: please fix the following\n\n${errors.map(e => `- ${e}`).join('\n')}\n\n_Edit the branch/description and this check re-runs automatically._`);
+              core.setFailed(`${errors.length} problem(s):\n- ` + errors.join('\n- '));
+              return;
+            }
+            if (sticky) {
+              await upsertPrComment(`${MARK}\n### ✅ PR Guard passed\nLinked to **${jiraKey}**${isBug ? ' · RCA synced to Jira' : ''}.`);
+            }
+
+            // ---------- 6. Jira sync (only for open PRs) ----------
+            if (pr.state !== 'open' || !issue) return;
+            const browse = `${base}/browse/${jiraKey}`;
+
+            // 6a. RCA comment (bugs only), created once and updated on edits
+            if (isBug && rca && ['opened', 'reopened', 'edited', 'ready_for_review'].includes(action)) {
+              const tag = `pr-guard:${owner}/${repo}#${pr.number}`;
+              const safeTitle = pr.title.replace(/[|\[\]]/g, ' ');
+              const jbody = [
+                'h3. 🐛 Root Cause Analysis',
+                `*Pull request:* [${safeTitle}|${pr.html_url}]  (by ${pr.user.login})`,
+                '', '*Problem:*', rca.problem,
+                '', '*Root cause:*', rca.rootCause,
+                '', '*Impact:*', rca.impact,
+                '', '*Prevention:*', rca.prevention,
+                '', '----',
+                `{color:#97a0af}${tag}: auto-synced from the PR description{color}`,
+              ].join('\n');
+              const existing = await jira('GET', `/rest/api/2/issue/${jiraKey}/comment?maxResults=100&orderBy=-created`);
+              const prev = existing.ok ? (existing.json.comments || []).find(c => (c.body || '').includes(tag)) : null;
+              let r;
+              if (prev && prev.body === jbody) { core.info('RCA comment unchanged.'); r = { ok: true }; }
+              else if (prev) r = await jira('PUT', `/rest/api/2/issue/${jiraKey}/comment/${prev.id}`, { body: jbody });
+              else r = await jira('POST', `/rest/api/2/issue/${jiraKey}/comment`, { body: jbody });
+              if (!r.ok) core.warning(`Could not write RCA comment (${r.status}): ${r.text?.slice(0, 300)}`);
+              else core.info(`RCA ${prev ? 'updated' : 'posted'} on ${browse}`);
+            }
+
+            // 6b. Transition to "In Review" (not for drafts, not on every push)
+            if (pr.draft || !['opened', 'reopened', 'edited', 'ready_for_review'].includes(action)) return;
+            const target = env.REVIEW_STATUS.toLowerCase();
+            const status = issue.fields.status;
+            if (status.name.toLowerCase() === target) { core.info(`${jiraKey} already "${status.name}".`); return; }
+            if (status.statusCategory?.key === 'done') { core.notice(`${jiraKey} is "${status.name}" (done); not moving it.`); return; }
+
+            const tr = await jira('GET', `/rest/api/2/issue/${jiraKey}/transitions`);
+            if (!tr.ok) { core.warning(`Could not load transitions (${tr.status}).`); return; }
+            const t = tr.json.transitions.find(x => x.to?.name?.toLowerCase() === target || x.name.toLowerCase() === target);
+            if (!t) {
+              core.warning(`No transition to "${env.REVIEW_STATUS}" from "${status.name}". Available: ` +
+                tr.json.transitions.map(x => `${x.name} → ${x.to?.name}`).join(', '));
+              return;
+            }
+            const done = await jira('POST', `/rest/api/2/issue/${jiraKey}/transitions`, { transition: { id: t.id } });
+            if (done.ok) core.info(`${jiraKey}: "${status.name}" → "${t.to.name}"`);
+            else core.warning(`Transition failed (${done.status}): ${done.text.slice(0, 300)}`);

@@ -1,0 +1,25 @@
+# Copy this file into EVERY repo as: .github/workflows/pr-guard.yml
+# Replace YOUR_GITHUB_USERNAME below.
+
+name: PR Guard
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-guard:
+    uses: paramveer-8th/pr-automation/.github/workflows/pr-guard.yml@main
+    with:
+      jira_projects: "LYRIC"        # comma-separated; "" = any project
+      review_status: "In Review"    # must match your Jira status name
+    secrets: inherit
