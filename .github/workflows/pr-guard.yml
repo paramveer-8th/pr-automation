@@ -85,12 +85,14 @@ jobs:
             }
 
             // ---------- 2. Parse PR description ----------
+            // Empty/missing sections are WARNINGS only: the PR still passes and Jira still updates.
+            const warnings = [];
             const clean = (pr.body || '').replace(/<!--[\s\S]*?-->/g, '').replace(/\r\n/g, '\n');
             const sections = {};
             for (const part of clean.split(/^##\s+/m).slice(1)) {
               const nl = part.indexOf('\n');
               const title = (nl === -1 ? part : part.slice(0, nl));
-              const key = title.replace(/[^a-zA-Z& ]/g, '').trim().toLowerCase();
+              const key = title.replace(/[^a-zA-Z& ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
               sections[key] = nl === -1 ? '' : part.slice(nl + 1);
             }
             // Text that's left after removing empty template scaffolding
@@ -99,7 +101,7 @@ jobs:
               !/^[-*]$/.test(l) &&                // empty bullet
               !/^\d+\.$/.test(l) &&               // empty numbered step
               !/^-{3,}$/.test(l) &&               // horizontal rule
-              !/^\*\*[^*]+:\*\*$/.test(l) &&      // label with no value, e.g. **Expected result:**
+              !/^\*\*[^*]+:\*\*$/.test(l) &&      // label with no value, e.g. **Expected:**
               !/^[-*]\s*\[[ xX]\]/.test(l)        // checkbox lines
             ).join('\n').trim();
             const field = (text, label) => {
@@ -107,18 +109,20 @@ jobs:
               const m = (text || '').match(r);
               return m ? meaningful(m[1]) : '';
             };
+            const nice = s => s.replace(/\b\w/g, c => c.toUpperCase());
 
-            if (!pr.body || !pr.body.trim()) {
-              errors.push('PR description is empty. Please use the PR template.');
+            if (!clean.trim()) {
+              warnings.push('PR description is empty. Please use the PR template.');
             } else {
               for (const s of ['summary', 'what changed', 'how to test']) {
-                if (!(s in sections)) errors.push(`Section **## ${s.replace(/\b\w/g, c => c.toUpperCase())}** is missing.`);
-                else if (!meaningful(sections[s])) errors.push(`Section **${s.replace(/\b\w/g, c => c.toUpperCase())}** is empty.`);
+                if (!(s in sections)) warnings.push(`Section **${nice(s)}** is missing.`);
+                else if (!meaningful(sections[s])) warnings.push(`Section **${nice(s)}** was left empty.`);
               }
-              if (!('type of change' in sections)) errors.push('Section **## Type of change** is missing.');
-              else if (!/-\s*\[[xX]\]/.test(sections['type of change'])) errors.push('Tick at least one box under **Type of change**.');
-              if (!('impact & risk' in sections)) errors.push('Section **## Impact & Risk** is missing.');
-              else if (!/\*\*Risk level:\*\*\s*(Low|Medium|High)\b/i.test(sections['impact & risk'])) errors.push('Set **Risk level:** to Low, Medium or High.');
+              if (!('type' in sections)) warnings.push('Section **Type** is missing.');
+              else if (!/-\s*\[[xX]\]/.test(sections['type'])) warnings.push('No box ticked under **Type**.');
+              const lvl = ((sections['risk'] || '').match(/\*\*Level:\*\*\s*([^·\n*]*)/i) || [])[1]?.trim() || '';
+              if (!('risk' in sections)) warnings.push('Section **Risk** is missing.');
+              else if (!/^(low|medium|high)$/i.test(lvl)) warnings.push('**Risk → Level** not set (pick one of Low / Medium / High).');
             }
 
             // ---------- 3. Jira lookup ----------
@@ -148,27 +152,24 @@ jobs:
             }
 
             // ---------- 4. Bug detection + RCA ----------
-            const bugTicked = /-\s*\[[xX]\][^\n]*bug fix/i.test(sections['type of change'] || '');
+            const bugTicked = /-\s*\[[xX]\][^\n]*bug fix/i.test(sections['type'] || '');
             const bugBranch = list(env.BUG_BRANCH_TYPES).includes(branchType);
             const bugIssue = /bug/i.test(issue?.fields?.issuetype?.name || '');
             const isBug = bugTicked || bugBranch || bugIssue;
             let rca = null;
-            if (isBug && (pr.body || "").trim()) {
-              const rcaText = sections['root cause analysis'];
-              if (rcaText === undefined) {
-                errors.push('This is a bug fix: the **🐛 Root Cause Analysis** section is required.');
-              } else {
-                rca = {
-                  problem: field(rcaText, 'Problem'),
-                  rootCause: field(rcaText, 'Root cause'),
-                  impact: field(rcaText, 'Impact'),
-                  prevention: field(rcaText, 'Prevention'),
-                };
-                const missing = Object.entries({ Problem: rca.problem, 'Root cause': rca.rootCause, Impact: rca.impact, Prevention: rca.prevention })
-                  .filter(([, v]) => !v).map(([k]) => `**${k}**`);
-                if (missing.length) errors.push(`Root Cause Analysis incomplete. Fill in: ${missing.join(', ')}.`);
-              }
-              if (!bugTicked) errors.push('This looks like a bug fix (branch prefix or Jira type). Tick **🐛 Bug fix** under Type of change.');
+            if (isBug) {
+              const rcaText = sections['root cause analysis'] || '';
+              if (!('root cause analysis' in sections)) warnings.push('Bug fix without a **Root Cause Analysis** section. Jira will get an empty RCA.');
+              rca = {
+                problem: field(rcaText, 'Problem'),
+                rootCause: field(rcaText, 'Root cause'),
+                impact: field(rcaText, 'Impact'),
+                prevention: field(rcaText, 'Prevention'),
+              };
+              const missing = Object.entries({ Problem: rca.problem, 'Root cause': rca.rootCause, Impact: rca.impact, Prevention: rca.prevention })
+                .filter(([, v]) => !v).map(([k]) => `**${k}**`);
+              if (missing.length && 'root cause analysis' in sections) warnings.push(`RCA left empty: ${missing.join(', ')}. Synced to Jira as "(left empty)".`);
+              if (!bugTicked) warnings.push('Treated as a bug fix (branch prefix or Jira type), but **Bug fix** isn\'t ticked under Type.');
             }
 
             // ---------- 5. Sticky PR comment ----------
@@ -179,14 +180,18 @@ jobs:
               if (sticky) { if (sticky.body !== body) await github.rest.issues.updateComment({ owner, repo, comment_id: sticky.id, body }); }
               else await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
             }
+            const warnBlock = warnings.length
+              ? `\n\n#### ⚠️ Left empty (not blocking, but please fill in)\n${warnings.map(w => `- ${w}`).join('\n')}` : '';
 
             if (errors.length) {
-              await upsertPrComment(`${MARK}\n### ❌ PR Guard: please fix the following\n\n${errors.map(e => `- ${e}`).join('\n')}\n\n_Edit the branch/description and this check re-runs automatically._`);
+              await upsertPrComment(`${MARK}\n### ❌ PR Guard: please fix the following\n\n${errors.map(e => `- ${e}`).join('\n')}${warnBlock}\n\n_Edit the branch/description and this check re-runs automatically._`);
+              warnings.forEach(w => core.warning(w));
               core.setFailed(`${errors.length} problem(s):\n- ` + errors.join('\n- '));
               return;
             }
-            if (sticky) {
-              await upsertPrComment(`${MARK}\n### ✅ PR Guard passed\nLinked to **${jiraKey}**${isBug ? ' · RCA synced to Jira' : ''}.`);
+            warnings.forEach(w => core.warning(w));
+            if (warnings.length || sticky) {
+              await upsertPrComment(`${MARK}\n### ${warnings.length ? '⚠️' : '✅'} PR Guard passed\nLinked to **${jiraKey}**${isBug ? ' · RCA synced to Jira' : ''}.${warnBlock}`);
             }
 
             // ---------- 6. Jira sync (only for open PRs) ----------
@@ -196,14 +201,15 @@ jobs:
             // 6a. RCA comment (bugs only), created once and updated on edits
             if (isBug && rca && ['opened', 'reopened', 'edited', 'ready_for_review'].includes(action)) {
               const tag = `pr-guard:${owner}/${repo}#${pr.number}`;
+              const EMPTY = '{color:#de350b}_(left empty)_{color}';
               const safeTitle = pr.title.replace(/[|\[\]]/g, ' ');
               const jbody = [
                 'h3. 🐛 Root Cause Analysis',
                 `*Pull request:* [${safeTitle}|${pr.html_url}]  (by ${pr.user.login})`,
-                '', '*Problem:*', rca.problem,
-                '', '*Root cause:*', rca.rootCause,
-                '', '*Impact:*', rca.impact,
-                '', '*Prevention:*', rca.prevention,
+                '', '*Problem:*', rca.problem || EMPTY,
+                '', '*Root cause:*', rca.rootCause || EMPTY,
+                '', '*Impact:*', rca.impact || EMPTY,
+                '', '*Prevention:*', rca.prevention || EMPTY,
                 '', '----',
                 `{color:#97a0af}${tag}: auto-synced from the PR description{color}`,
               ].join('\n');
