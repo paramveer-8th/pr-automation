@@ -22,6 +22,10 @@ on:
         description: "Branch prefixes that are always treated as bug fixes (RCA required)"
         type: string
         default: "fix,hotfix"
+      allowed_statuses:
+        description: "Jira statuses a ticket must be in when the PR is raised"
+        type: string
+        default: "In Progress,In Review"
       rca_field:
         description: "Jira custom field id that stores the RCA"
         type: string
@@ -55,6 +59,7 @@ jobs:
           BUG_BRANCH_TYPES: ${{ inputs.bug_branch_types }}
           EXEMPT_PREFIXES: ${{ inputs.exempt_branch_prefixes }}
           RCA_FIELD: ${{ inputs.rca_field }}
+          ALLOWED_STATUSES: ${{ inputs.allowed_statuses }}
         with:
           script: |
             const env = process.env;
@@ -154,6 +159,19 @@ jobs:
               else if (r.status === 401 || r.status === 403) errors.push(`Jira auth failed (${r.status}). Check JIRA_EMAIL / JIRA_API_TOKEN.`);
               else if (!r.ok) core.warning(`Jira lookup failed (${r.status}): ${r.text.slice(0, 300)}`);
               else issue = r.json;
+            }
+
+            // Ticket must be In Progress (or already In Review)
+            if (issue) {
+              const st = issue.fields.status;
+              const allowed = list(env.ALLOWED_STATUSES).map(x => x.toLowerCase());
+              if (allowed.length && !allowed.includes(st.name.toLowerCase())) {
+                if (st.statusCategory?.key === 'done') {
+                  errors.push(`Jira ticket **${jiraKey}** is already **${st.name}**. Reopen it (move to In Progress) or create a new ticket.`);
+                } else {
+                  errors.push(`Jira ticket **${jiraKey}** is **${st.name}**. Move it to **In Progress** first, then edit the PR description or click **Re-run** on this check.`);
+                }
+              }
             }
 
             // ---------- 4. Bug detection + RCA ----------
