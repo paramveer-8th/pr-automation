@@ -152,25 +152,33 @@ jobs:
             }
 
             // ---------- 4. Bug detection + RCA ----------
+            // Bug = "Bug fix" ticked OR Jira ticket type is Bug. A fix/ or hotfix/ branch alone is only a hint.
             const bugTicked = /-\s*\[[xX]\][^\n]*bug fix/i.test(sections['type'] || '');
             const bugBranch = list(env.BUG_BRANCH_TYPES).includes(branchType);
             const bugIssue = /bug/i.test(issue?.fields?.issuetype?.name || '');
-            const isBug = bugTicked || bugBranch || bugIssue;
+            const isBug = bugTicked || bugIssue;
+            if (bugBranch && !isBug) warnings.push(`Branch starts with \`${branchType}/\`. If this is a bug fix, tick **Bug fix** under Type (RCA becomes required).`);
+
+            const rcaErrors = [];   // block merge, but Jira status still moves
             let rca = null;
             if (isBug) {
               const rcaText = sections['root cause analysis'] || '';
-              if (!('root cause analysis' in sections)) warnings.push('Bug fix without a **Root Cause Analysis** section. Jira will get an empty RCA.');
               rca = {
                 problem: field(rcaText, 'Problem'),
                 rootCause: field(rcaText, 'Root cause'),
                 impact: field(rcaText, 'Impact'),
                 prevention: field(rcaText, 'Prevention'),
               };
-              const missing = Object.entries({ Problem: rca.problem, 'Root cause': rca.rootCause, Impact: rca.impact, Prevention: rca.prevention })
-                .filter(([, v]) => !v).map(([k]) => `**${k}**`);
-              if (missing.length && 'root cause analysis' in sections) warnings.push(`RCA left empty: ${missing.join(', ')}. Synced to Jira as "(left empty)".`);
-              if (!bugTicked) warnings.push('Treated as a bug fix (branch prefix or Jira type), but **Bug fix** isn\'t ticked under Type.');
+              const why = bugTicked ? 'Bug fix is ticked' : `Jira ticket ${jiraKey} is a Bug`;
+              if (!('root cause analysis' in sections)) {
+                rcaErrors.push(`${why}: add the **Root Cause Analysis** section (Problem, Root cause, Impact, Prevention).`);
+              } else {
+                const missing = Object.entries({ Problem: rca.problem, 'Root cause': rca.rootCause, Impact: rca.impact, Prevention: rca.prevention })
+                  .filter(([, v]) => !v).map(([k]) => `**${k}**`);
+                if (missing.length) rcaErrors.push(`${why}: Root Cause Analysis incomplete. Fill in ${missing.join(', ')}. It's sent to Jira once complete.`);
+              }
             }
+            const rcaComplete = isBug && rcaErrors.length === 0;
 
             // ---------- 5. Sticky PR comment ----------
             const MARK = '<!-- pr-guard -->';
@@ -181,63 +189,71 @@ jobs:
               else await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
             }
             const warnBlock = warnings.length
-              ? `\n\n#### ⚠️ Left empty (not blocking, but please fill in)\n${warnings.map(w => `- ${w}`).join('\n')}` : '';
+              ? `\n\n#### ⚠️ Not blocking, but please fill in\n${warnings.map(w => `- ${w}`).join('\n')}` : '';
+            const footer = '\n\n_Edit the branch/description and this check re-runs automatically._';
+            warnings.forEach(w => core.warning(w));
 
+            // Hard errors: nothing touches Jira
             if (errors.length) {
-              await upsertPrComment(`${MARK}\n### ❌ PR Guard: please fix the following\n\n${errors.map(e => `- ${e}`).join('\n')}${warnBlock}\n\n_Edit the branch/description and this check re-runs automatically._`);
-              warnings.forEach(w => core.warning(w));
+              await upsertPrComment(`${MARK}\n### ❌ PR Guard: please fix the following\n\n${errors.map(e => `- ${e}`).join('\n')}${warnBlock}${footer}`);
               core.setFailed(`${errors.length} problem(s):\n- ` + errors.join('\n- '));
               return;
             }
-            warnings.forEach(w => core.warning(w));
-            if (warnings.length || sticky) {
-              await upsertPrComment(`${MARK}\n### ${warnings.length ? '⚠️' : '✅'} PR Guard passed\nLinked to **${jiraKey}**${isBug ? ' · RCA synced to Jira' : ''}.${warnBlock}`);
+            if (rcaErrors.length) {
+              await upsertPrComment(`${MARK}\n### ❌ PR Guard: RCA required before merge\nLinked to **${jiraKey}** (status still moves to ${env.REVIEW_STATUS}).\n\n${rcaErrors.map(e => `- ${e}`).join('\n')}${warnBlock}${footer}`);
+            } else if (warnings.length || sticky) {
+              await upsertPrComment(`${MARK}\n### ${warnings.length ? '⚠️' : '✅'} PR Guard passed\nLinked to **${jiraKey}**${rcaComplete ? ' · RCA synced to Jira' : ''}.${warnBlock}`);
             }
 
             // ---------- 6. Jira sync (only for open PRs) ----------
-            if (pr.state !== 'open' || !issue) return;
-            const browse = `${base}/browse/${jiraKey}`;
+            const jiraEvents = ['opened', 'reopened', 'edited', 'ready_for_review'];
+            if (pr.state === 'open' && issue && jiraEvents.includes(action)) {
+              const browse = `${base}/browse/${jiraKey}`;
 
-            // 6a. RCA comment (bugs only), created once and updated on edits
-            if (isBug && rca && ['opened', 'reopened', 'edited', 'ready_for_review'].includes(action)) {
-              const tag = `pr-guard:${owner}/${repo}#${pr.number}`;
-              const EMPTY = '{color:#de350b}_(left empty)_{color}';
-              const safeTitle = pr.title.replace(/[|\[\]]/g, ' ');
-              const jbody = [
-                'h3. 🐛 Root Cause Analysis',
-                `*Pull request:* [${safeTitle}|${pr.html_url}]  (by ${pr.user.login})`,
-                '', '*Problem:*', rca.problem || EMPTY,
-                '', '*Root cause:*', rca.rootCause || EMPTY,
-                '', '*Impact:*', rca.impact || EMPTY,
-                '', '*Prevention:*', rca.prevention || EMPTY,
-                '', '----',
-                `{color:#97a0af}${tag}: auto-synced from the PR description{color}`,
-              ].join('\n');
-              const existing = await jira('GET', `/rest/api/2/issue/${jiraKey}/comment?maxResults=100&orderBy=-created`);
-              const prev = existing.ok ? (existing.json.comments || []).find(c => (c.body || '').includes(tag)) : null;
-              let r;
-              if (prev && prev.body === jbody) { core.info('RCA comment unchanged.'); r = { ok: true }; }
-              else if (prev) r = await jira('PUT', `/rest/api/2/issue/${jiraKey}/comment/${prev.id}`, { body: jbody });
-              else r = await jira('POST', `/rest/api/2/issue/${jiraKey}/comment`, { body: jbody });
-              if (!r.ok) core.warning(`Could not write RCA comment (${r.status}): ${r.text?.slice(0, 300)}`);
-              else core.info(`RCA ${prev ? 'updated' : 'posted'} on ${browse}`);
+              // 6a. RCA comment: only when complete. Created once, updated on later edits.
+              if (rcaComplete) {
+                const tag = `pr-guard:${owner}/${repo}#${pr.number}`;
+                const safeTitle = pr.title.replace(/[|\[\]]/g, ' ');
+                const jbody = [
+                  'h3. 🐛 Root Cause Analysis',
+                  `*Pull request:* [${safeTitle}|${pr.html_url}]  (by ${pr.user.login})`,
+                  '', '*Problem:*', rca.problem,
+                  '', '*Root cause:*', rca.rootCause,
+                  '', '*Impact:*', rca.impact,
+                  '', '*Prevention:*', rca.prevention,
+                  '', '----',
+                  `{color:#97a0af}${tag}: auto-synced from the PR description{color}`,
+                ].join('\n');
+                const existing = await jira('GET', `/rest/api/2/issue/${jiraKey}/comment?maxResults=100&orderBy=-created`);
+                const prev = existing.ok ? (existing.json.comments || []).find(c => (c.body || '').includes(tag)) : null;
+                let r;
+                if (prev && prev.body === jbody) { core.info('RCA comment unchanged.'); r = { ok: true }; }
+                else if (prev) r = await jira('PUT', `/rest/api/2/issue/${jiraKey}/comment/${prev.id}`, { body: jbody });
+                else r = await jira('POST', `/rest/api/2/issue/${jiraKey}/comment`, { body: jbody });
+                if (!r.ok) core.warning(`Could not write RCA comment (${r.status}): ${r.text?.slice(0, 300)}`);
+                else core.info(`RCA ${prev ? 'updated' : 'posted'} on ${browse}`);
+              }
+
+              // 6b. Transition to "In Review" (not for drafts). Happens even if RCA is incomplete.
+              if (!pr.draft) {
+                const target = env.REVIEW_STATUS.toLowerCase();
+                const status = issue.fields.status;
+                if (status.name.toLowerCase() === target) core.info(`${jiraKey} already "${status.name}".`);
+                else if (status.statusCategory?.key === 'done') core.notice(`${jiraKey} is "${status.name}" (done); not moving it.`);
+                else {
+                  const tr = await jira('GET', `/rest/api/2/issue/${jiraKey}/transitions`);
+                  const t = tr.ok ? tr.json.transitions.find(x => x.to?.name?.toLowerCase() === target || x.name.toLowerCase() === target) : null;
+                  if (!tr.ok) core.warning(`Could not load transitions (${tr.status}).`);
+                  else if (!t) core.warning(`No transition to "${env.REVIEW_STATUS}" from "${status.name}". Available: ` +
+                    tr.json.transitions.map(x => `${x.name} → ${x.to?.name}`).join(', '));
+                  else {
+                    const done = await jira('POST', `/rest/api/2/issue/${jiraKey}/transitions`, { transition: { id: t.id } });
+                    if (done.ok) core.info(`${jiraKey}: "${status.name}" → "${t.to.name}"`);
+                    else core.warning(`Transition failed (${done.status}): ${done.text.slice(0, 300)}`);
+                  }
+                }
+              }
             }
 
-            // 6b. Transition to "In Review" (not for drafts, not on every push)
-            if (pr.draft || !['opened', 'reopened', 'edited', 'ready_for_review'].includes(action)) return;
-            const target = env.REVIEW_STATUS.toLowerCase();
-            const status = issue.fields.status;
-            if (status.name.toLowerCase() === target) { core.info(`${jiraKey} already "${status.name}".`); return; }
-            if (status.statusCategory?.key === 'done') { core.notice(`${jiraKey} is "${status.name}" (done); not moving it.`); return; }
-
-            const tr = await jira('GET', `/rest/api/2/issue/${jiraKey}/transitions`);
-            if (!tr.ok) { core.warning(`Could not load transitions (${tr.status}).`); return; }
-            const t = tr.json.transitions.find(x => x.to?.name?.toLowerCase() === target || x.name.toLowerCase() === target);
-            if (!t) {
-              core.warning(`No transition to "${env.REVIEW_STATUS}" from "${status.name}". Available: ` +
-                tr.json.transitions.map(x => `${x.name} → ${x.to?.name}`).join(', '));
-              return;
-            }
-            const done = await jira('POST', `/rest/api/2/issue/${jiraKey}/transitions`, { transition: { id: t.id } });
-            if (done.ok) core.info(`${jiraKey}: "${status.name}" → "${t.to.name}"`);
-            else core.warning(`Transition failed (${done.status}): ${done.text.slice(0, 300)}`);
+            // ---------- 7. Block merge if RCA incomplete ----------
+            if (rcaErrors.length) core.setFailed(rcaErrors.join('\n'));
