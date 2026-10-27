@@ -1,0 +1,102 @@
+# Reusable workflow: when a new branch like feat/LYRIC-539-name is pushed,
+# move the Jira ticket from "To Do" to "In Progress".
+# Lives in: <you>/pr-automation/.github/workflows/branch-start.yml
+# Called by caller-stub/branch-start.yml in every repo.
+
+name: Jira Branch Start (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      jira_projects:
+        description: "Comma-separated allowed Jira project keys (empty = any)"
+        type: string
+        default: ""
+      branch_types:
+        type: string
+        default: "feat,fix,hotfix,refactor,perf,docs,chore"
+      from_statuses:
+        description: "Only move the ticket if it is currently in one of these statuses"
+        type: string
+        default: "To Do"
+      target_status:
+        type: string
+        default: "In Progress"
+    secrets:
+      JIRA_BASE_URL:
+        required: false
+      JIRA_EMAIL:
+        required: false
+      JIRA_API_TOKEN:
+        required: false
+
+jobs:
+  start:
+    name: start
+    runs-on: ubuntu-latest
+    if: github.event_name == 'create' && github.event.ref_type == 'branch'
+    steps:
+      - name: Move Jira ticket to In Progress
+        uses: actions/github-script@v7
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECTS: ${{ inputs.jira_projects }}
+          BRANCH_TYPES: ${{ inputs.branch_types }}
+          FROM_STATUSES: ${{ inputs.from_statuses }}
+          TARGET_STATUS: ${{ inputs.target_status }}
+        with:
+          script: |
+            const env = process.env;
+            const list = s => (s || '').split(',').map(x => x.trim()).filter(Boolean);
+            const branch = context.payload.ref;              // e.g. feat/LYRIC-539-testing-task
+            const actor = context.actor;
+
+            // 1. Parse ticket ID from the branch name
+            const types = list(env.BRANCH_TYPES);
+            const m = branch.match(new RegExp(`^(${types.join('|')})\\/([A-Z][A-Z0-9]+-\\d+)-[a-z0-9]+(?:-[a-z0-9]+)*$`));
+            if (!m) { core.notice(`Branch "${branch}" has no valid <type>/<JIRA-ID>-<name> format. Nothing to do.`); return; }
+            const key = m[2];
+            const projects = list(env.JIRA_PROJECTS);
+            if (projects.length && !projects.includes(key.split('-')[0])) { core.notice(`Project of ${key} not in allowed list. Skipping.`); return; }
+
+            // 2. Jira helper
+            const base = (env.JIRA_BASE_URL || '').replace(/\/+$/, '');
+            if (!base || !env.JIRA_EMAIL || !env.JIRA_API_TOKEN) { core.setFailed('Jira secrets missing (JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN).'); return; }
+            const auth = 'Basic ' + Buffer.from(`${env.JIRA_EMAIL}:${env.JIRA_API_TOKEN}`).toString('base64');
+            async function jira(method, path, data) {
+              const res = await fetch(base + path, {
+                method,
+                headers: { Authorization: auth, Accept: 'application/json', 'Content-Type': 'application/json' },
+                body: data ? JSON.stringify(data) : undefined,
+              });
+              const text = await res.text();
+              let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
+              return { ok: res.ok, status: res.status, json, text };
+            }
+
+            // 3. Check current status
+            const r = await jira('GET', `/rest/api/2/issue/${key}?fields=status`);
+            if (r.status === 404) { core.warning(`Jira ticket ${key} not found (or the automation user can't see it).`); return; }
+            if (!r.ok) { core.warning(`Jira lookup failed (${r.status}): ${r.text.slice(0, 300)}`); return; }
+            const status = r.json.fields.status.name;
+            const from = list(env.FROM_STATUSES).map(s => s.toLowerCase());
+            if (!from.includes(status.toLowerCase())) {
+              core.info(`${key} is "${status}", not in [${env.FROM_STATUSES}]. Leaving it as is.`);
+              return;
+            }
+
+            // 4. Transition to In Progress
+            const target = env.TARGET_STATUS.toLowerCase();
+            const tr = await jira('GET', `/rest/api/2/issue/${key}/transitions`);
+            if (!tr.ok) { core.warning(`Could not load transitions (${tr.status}).`); return; }
+            const t = tr.json.transitions.find(x => x.to?.name?.toLowerCase() === target || x.name.toLowerCase() === target);
+            if (!t) {
+              core.warning(`No transition to "${env.TARGET_STATUS}" from "${status}". Available: ` +
+                tr.json.transitions.map(x => `${x.name} → ${x.to?.name}`).join(', '));
+              return;
+            }
+            const done = await jira('POST', `/rest/api/2/issue/${key}/transitions`, { transition: { id: t.id } });
+            if (done.ok) core.notice(`${key}: "${status}" → "${t.to.name}" (branch ${branch} pushed by ${actor})`);
+            else core.warning(`Transition failed (${done.status}): ${done.text.slice(0, 300)}`);
